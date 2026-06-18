@@ -31,7 +31,7 @@ Si los 3 servicios devuelven datos → verificado. Si alguno falla, ajustar los 
 2. En el PC del cliente, añadir el MCP a Claude:
    - **Claude Code:**
      ```bash
-     claude mcp add beebole --env BEEBOLE_API_KEY=LA_KEY -- npx -y @neonexai/beebole-mcp
+     claude mcp add beebole --env BEEBOLE_API_KEY=LA_KEY -- npx -y github:NeoNexAI/beebole-mcp
      ```
    - **Claude Desktop** (`claude_desktop_config.json`):
      ```json
@@ -39,7 +39,7 @@ Si los 3 servicios devuelven datos → verificado. Si alguno falla, ajustar los 
        "mcpServers": {
          "beebole": {
            "command": "npx",
-           "args": ["-y", "@neonexai/beebole-mcp"],
+           "args": ["-y", "github:NeoNexAI/beebole-mcp"],
            "env": { "BEEBOLE_API_KEY": "LA_KEY" }
          }
        }
@@ -47,7 +47,7 @@ Si los 3 servicios devuelven datos → verificado. Si alguno falla, ajustar los 
      ```
 3. Reiniciar Claude. La key + los datos **nunca salen del PC del cliente** (solo hablan con Beebole).
 
-> Mientras no se publique en el registro npm privado, se puede apuntar a la carpeta: `args: ["/ruta/a/projects/beebole-mcp/dist/index.js"]` con `command: "node"`.
+> Publicado vía GitHub: `npx -y github:NeoNexAI/beebole-mcp` clona el repo, instala, compila (`prepare`) y arranca. Requiere **Node ≥18** en el PC. La primera ejecución tarda ~1 min (build); las siguientes usan caché de npx.
 
 ---
 
