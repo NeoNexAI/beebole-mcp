@@ -1,7 +1,7 @@
 {
   "name": "@neonexai/beebole-mcp",
-  "version": "0.1.0",
-  "description": "MCP server para Beebole (control de horas) — NeoNexAI. Transportes: stdio (local, recomendado) + Streamable HTTP (remoto en VPS).",
+  "version": "0.2.0",
+  "description": "MCP server para Beebole (control de horas) — NeoNexAI. 16 tools sobre la API legacy (lectura/análisis + imputación + aprobación + gestión). Transportes: stdio (local, recomendado) + Streamable HTTP (remoto en VPS).",
   "type": "module",
   "bin": {
     "beebole-mcp": "dist/index.js"
