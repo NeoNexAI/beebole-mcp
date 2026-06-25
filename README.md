@@ -1,140 +1,157 @@
 # @neonexai/beebole-mcp
 
-MCP server que conecta **Claude** con **Beebole** (control de horas). Dos modos:
+MCP server que conecta **Claude** (Claude Code / Claude Desktop) con **Beebole**
+(control de horas) a través de su **API GraphQL nueva** — la de la app rediseñada
+**`app.beebole.com`**.
 
-- **Local (stdio)** — *recomendado para clientes (GDPR)*: corre en el PC del cliente; su API key vive solo en su máquina; los datos no pasan por nuestro servidor.
-- **Remoto (HTTP, VPS)** — centralizado; el token viaja por cabecera `X-Beebole-Key` en cada petición y **no se almacena** (stateless multi-tenant).
+- **Endpoint:** `POST https://app.beebole.com/graphql`
+- **Auth:** cabecera `apikey: <API_KEY>` (la key se obtiene en `app.beebole.com → Settings → API`).
+- **Verificado e2e** (2026-06-25) contra la API real: 18/18 checks de lectura y
+  escritura (crear proyecto/tarea, fichar horas, editar, borrar, limpiar).
 
-> Construido sobre la API **legacy JSON-RPC** de Beebole (`POST beebole-apps.com/api/v2`, auth HTTP Basic `token:x`), la única con modelo de auth verificado. La API GraphQL moderna es más rica pero su cabecera de auth no está confirmada → futura migración con key + doc.
+Dos transportes:
 
----
-
-## Catálogo de tools (16)
-
-Cubren toda la superficie legacy (~110 servicios) consolidada. Las de lectura/análisis primero; las de escritura llevan `readOnlyHint:false` y avisan de "confirmar antes".
-
-| Tool | Tipo | Para qué |
-|---|---|---|
-| `beebole_list` | lectura | Lista companies, projects, subprojects, tasks, people, absence types o custom fields (de aquí salen los IDs) |
-| `beebole_get` | lectura | Detalle de una entidad por id |
-| `beebole_get_loggable_entities` | lectura | Árbol de dónde se pueden imputar horas en una fecha |
-| `beebole_get_loggable_tasks` | lectura | Tareas disponibles para una entidad+fecha |
-| `beebole_list_time_entries` | lectura | Imputaciones de UNA persona en un rango |
-| **`beebole_export_time`** | lectura | **Export para análisis**: horas por proyecto/persona/tarea, desviaciones, rentabilidad |
-| `beebole_log_time` | escritura | Registrar horas (hours decimal; task si la entidad la exige) |
-| `beebole_update_time_entry` | escritura | Editar una imputación |
-| `beebole_delete_time_entry` | escritura (destructiva) | Borrar una imputación |
-| `beebole_timesheet` | escritura | submit / approve / reject / lock / unlock de timesheets |
-| `beebole_manage_entity` | escritura | CRUD de company/project/subproject/task/person |
-| `beebole_manage_membership` | escritura | Miembros y managers de company/project/subproject |
-| `beebole_group_tree` | lectura | Árbol de grupos/tags |
-| `beebole_manage_group` | escritura | Crear / renombrar / borrar grupos |
-| `beebole_tag_entity` | escritura | Etiquetar una entidad con un grupo |
-| `beebole_custom_field` | lectura+escritura | Definiciones y valores de custom fields |
-
-Caso de uso estrella para Cota Zero: *"horas por proyecto este mes y dónde nos desviamos"* → `beebole_export_time` con `from`/`to`.
+- **Local (stdio)** — *recomendado (GDPR)*: corre en el PC del cliente; su API key
+  vive solo en su máquina y los datos no pasan por ningún servidor intermedio.
+- **Remoto (HTTP, VPS)** — centralizado; el token viaja por cabecera
+  `X-Beebole-Key` en cada petición y **no se almacena** (stateless multi-tenant).
 
 ---
 
-## ⚠️ SPIKE de verificación con key real (1 vez, bloqueante para "operativo")
+## Arquitectura: híbrida (curadas + passthrough)
 
-Los nombres de servicio y el shape están mapeados contra la doc oficial legacy, pero **deben confirmarse en vivo** con una key real antes de marcar el MCP como verificado:
+La API GraphQL nueva es enorme y *fine-grained*: **87 queries + 745 mutations**
+(cada campo editable tiene su propia mutation). Exponer eso 1:1 saturaría a
+cualquier agente. Por eso el server combina dos capas:
 
-```bash
-npm install
-npm run build
-BEEBOLE_API_KEY="LA_KEY" SMOKE_FROM=2026-05-01 SMOKE_TO=2026-05-31 npm run smoke
-```
+**A) ~24 tools curadas** para el flujo real de un estudio:
 
-El smoke prueba 8 servicios de lectura e imprime `OK=n FALLO=n`. Si todo OK → verificado. Si algo falla, ajustar el servicio en `src/beebole.ts` y repetir.
+| Área | Tools |
+|---|---|
+| Identidad | `beebole_whoami` |
+| Proyectos | `beebole_list_projects`, `beebole_get_project`, `beebole_add_project` |
+| Tareas | `beebole_list_tasks`, `beebole_get_task`, `beebole_add_task` |
+| Personas | `beebole_list_persons`, `beebole_get_person`, `beebole_add_person` |
+| Fichaje de horas | `beebole_list_time_records`, `beebole_count_time_records`, `beebole_add_time_record`, `beebole_edit_time_record`, `beebole_delete_time_records`, `beebole_clone_time_records` |
+| Timesheets | `beebole_submit_timesheet`, `beebole_approve_timesheet`, `beebole_reject_timesheet` |
+| Catálogos | `beebole_list_tags`, `beebole_list_absence_types` |
+| Informes | `beebole_list_reports`, `beebole_run_report`, `beebole_planned_vs_real` |
+
+**B) 3 tools genéricas** para cobertura del **100%** de la API (las ~800
+operaciones restantes de administración/configuración):
+
+- `beebole_search_schema` — descubre cualquier operación por palabra clave.
+- `beebole_describe_operation` — su firma completa (args + input objects + retorno).
+- `beebole_graphql` — ejecuta cualquier query/mutation cruda.
+
+Flujo para algo sin tool curada: **search → describe → graphql**.
+
+### Notas de dominio (del propio schema)
+
+- **Timestamps**: `BeeboleTimestamp` = Unix epoch en **milisegundos** (`> 1e10`).
+- **Duración** de un time record: entero en **minutos** (ej. `90` = 1 h 30 min).
+  Beebole lo interpreta según los *time settings* de la organización; confírmalo
+  visualmente la primera vez.
+- **Estados** (`status`): `d`=draft, `s`=submitted, `a`=approved, `r`=rejected.
+- **Color**: índice de paleta `0-71`. **Ausencias**: unidad `day` o `hour`.
+- `addProject` / `addTask` requieren **`categoryId` o `parentId`** (la API
+  rechaza con `NoCategoryOrParentProvided` si no se da ninguno).
 
 ---
 
-## 🔌 Guía de conexión paso a paso (sesión 4)
+## Instalación
 
-> En la sesión 3 falló porque (a) no había una `BEEBOLE_API_KEY` válida → el server sale con código 1 y Claude lo marca como **caído/“not running”**, y (b) la config se escribió en `C:/Users/Usuario/.claude.json` (scope equivocado). Esta guía evita ambos.
+Requisitos: **Node ≥ 18** y una **API key de Beebole** (`app.beebole.com → Settings → API`).
 
-**Paso 0 — Requisitos en el PC:** Node ≥ 18 y Git instalados (los pone la guía de la sesión 3).
+### A) Local en el PC del cliente (recomendado · stdio)
 
-**Paso 1 — Conseguir la API key (lo hace Cota Zero):**
-1. Beebole → **Settings → Account** → habilitar **"Enable API calls"**.
-2. Copiar el **API Token** (módulo "API Token"). Usar un usuario con permisos mínimos, no admin global.
-
-**Paso 2 — Verificar la key ANTES de enchufarla a Claude** (clave para no caer en el "not running"):
+Se ejecuta directamente desde GitHub con `npx`, sin clonar nada:
 
 ```bash
-# Debe responder JSON con status ok. Si da 401/403 → la key o "API calls" están mal.
-curl -s -u "LA_KEY:x" -H "Content-Type: application/json" \
-  -d '{"service":"company.list"}' https://beebole-apps.com/api/v2
-```
-
-**Paso 3 — Añadir el MCP a Claude Code con scope de USUARIO explícito** (no de proyecto → así vale en todas las carpetas y no se pierde):
-
-```bash
-claude mcp add -s user beebole \
-  --env BEEBOLE_API_KEY=LA_KEY \
+claude mcp add beebole \
+  --env BEEBOLE_API_KEY=TU_API_KEY \
   -- npx -y github:NeoNexAI/beebole-mcp
 ```
 
-**Paso 4 — Comprobar que está conectado:**
-
-```bash
-claude mcp list          # debe aparecer: beebole ✓ connected
-```
-o dentro de Claude Code: `/mcp` → `beebole` en verde. La **primera** ejecución de `npx` clona+compila (~1 min); las siguientes usan caché.
-
-**Paso 5 — Probar de verdad:** *"Lista mis proyectos de Beebole"* (usa `beebole_list`), luego *"¿cuántas horas llevamos en el proyecto X este mes?"* (usa `beebole_export_time`).
-
-### Troubleshooting "no conecta / not running"
-| Síntoma | Causa | Solución |
-|---|---|---|
-| Sale como caído al instante | `BEEBOLE_API_KEY` ausente/inválida → exit 1 | Verificar la key con el curl del Paso 2 |
-| 401/403 en las llamadas | "API calls" deshabilitado o key mala | Habilitar en Settings → Account; regenerar token |
-| Aparece en un scope y no en otro | Config en `.claude.json` de proyecto | Reinstalar con `-s user` (Paso 3) |
-| Tarda y luego va | Primer `npx` compilando | Esperar ~1 min la 1ª vez |
-
----
-
-## Modo LOCAL (stdio) — Claude Desktop
-
-Para Claude Desktop, en `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "beebole": {
-      "command": "npx",
-      "args": ["-y", "github:NeoNexAI/beebole-mcp"],
-      "env": { "BEEBOLE_API_KEY": "LA_KEY" }
+- `-s user` (scope usuario) lo deja disponible en **todos los proyectos** de ese PC:
+  ```bash
+  claude mcp add beebole -s user --env BEEBOLE_API_KEY=TU_API_KEY -- npx -y github:NeoNexAI/beebole-mcp
+  ```
+- En **Claude Desktop**, añade el bloque equivalente en su `mcp.json`:
+  ```json
+  {
+    "mcpServers": {
+      "beebole": {
+        "command": "npx",
+        "args": ["-y", "github:NeoNexAI/beebole-mcp"],
+        "env": { "BEEBOLE_API_KEY": "TU_API_KEY" }
+      }
     }
   }
-}
+  ```
+
+Verifica la key **antes** de añadirlo (debe responder con tu nombre):
+
+```bash
+curl -s -H "apikey: TU_API_KEY" -H "Content-Type: application/json" \
+  -X POST https://app.beebole.com/graphql \
+  -d '{"query":"{ currentPerson{ id name email } }"}'
 ```
 
-La key + los datos **nunca salen del PC** (solo hablan con Beebole). Reiniciar Claude Desktop tras editar el config.
+### B) Despliegue para un equipo (plan Team)
+
+No hay un “instalar para toda la organización” de un click para un MCP propio: cada
+equipo lo corre **en local** (stdio) con la API key correspondiente. Para
+estandarizarlo en varios PCs:
+
+- **Misma cuenta Beebole de empresa** → repartid la **misma API key** (cada PC la
+  pone en su `BEEBOLE_API_KEY`; nunca en el repo).
+- **Cada persona con su propio usuario Beebole** → cada PC usa **su** API key (el
+  server actúa siempre como esa persona).
+- Para fijar la config en un repo compartido, commitea un `.mcp.json` (scope
+  *project*) **sin la key** y que cada entorno aporte `BEEBOLE_API_KEY` por
+  variable de entorno. La key es un secreto: **nunca** se commitea.
+
+> Alternativa centralizada: desplegar el modo **HTTP** en el VPS (un solo sitio) y
+> que cada cliente Claude apunte ahí enviando su token por `X-Beebole-Key`. Útil si
+> no quieres instalar Node en cada PC; menos recomendable para datos GDPR sensibles.
 
 ---
 
-## Modo REMOTO (HTTP, VPS)
+## Desarrollo
 
-1. Deploy en Coolify (Build Pack = Dockerfile), puerto host **8087**, vhost nginx `beebole-mcp.neonexai.com` + certbot (mismo patrón que el resto de apps NeoNex).
-2. Conectar con la key en la cabecera:
-   ```bash
-   claude mcp add --transport http beebole \
-     https://beebole-mcp.neonexai.com/mcp \
-     --header "X-Beebole-Key: LA_KEY"
-   ```
-   Claude Desktop vía puente: `npx -y mcp-remote https://beebole-mcp.neonexai.com/mcp --header "X-Beebole-Key:LA_KEY"`.
-3. Health: `GET https://beebole-mcp.neonexai.com/health` → `{"ok":true}`.
+```bash
+npm install
+npm run build          # tsc → dist/  (incluye schema.json para selección/búsqueda)
+npm run typecheck
+BEEBOLE_API_KEY=... npm run smoke           # 9 checks de lectura e2e
+BEEBOLE_API_KEY=... SMOKE_WRITE=1 npm run smoke   # + ciclo de escritura (SOLO cuenta de pruebas)
+```
 
-**Seguridad:** stateless (server efímero por petición), token no persistido ni loggeado, TLS obligatorio. La key hereda los permisos de su usuario en Beebole → permisos mínimos.
+El `smoke` con `SMOKE_WRITE=1` crea entidades `ZZ_SMOKE_TEST_*`, ficha, edita y
+**borra todo** al terminar; úsalo solo en una cuenta de pruebas.
+
+### Modo HTTP (VPS)
+
+```bash
+MCP_TRANSPORT=http PORT=8087 node dist/index.js
+# POST /mcp con cabecera X-Beebole-Key: <token>   ·   GET /health
+```
 
 ---
 
-## Estado
+## Estructura
 
-- [x] Código: cliente legacy completo + **16 tools** + doble transporte + Docker
-- [x] Build + typecheck verdes; roundtrip MCP (tools/list) verificado en memoria
-- [ ] **Spike con key real** (`npm run smoke`) — bloqueante para "operativo-verificado"
-- [ ] Conexión en el PC de Cota Zero (modo local, sesión 4)
-- [x] skill-vetter SAFE (código propio, auditado)
+```
+src/
+  index.ts    — entry point (stdio | HTTP)
+  client.ts   — cliente GraphQL (auth apikey) + helpers de schema (selección/búsqueda/describe)
+  tools.ts    — registro de las 27 tools (factoría buildServer(apiKey))
+  smoke.ts    — test e2e contra la API real
+schema.json   — introspección de la API (bundleada; potencia selección + search/describe)
+```
+
+---
+
+*Beebole API GraphQL — auth y endpoint verificados empíricamente 2026-06-25. Las
+funciones de Beebole evolucionan; reverificar en `app.beebole.com` ante cambios.*

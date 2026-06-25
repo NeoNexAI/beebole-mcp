@@ -1,374 +1,756 @@
 /**
- * Tools del MCP de Beebole. Una factoría crea un McpServer ligado a un cliente
- * Beebole (un token). En stdio el token viene del entorno; en HTTP, de la
- * cabecera por petición (multi-tenant stateless).
+ * Tools del MCP de Beebole sobre la API GraphQL nueva (app.beebole.com/graphql).
  *
- * Diseño: 16 tools consolidadas que cubren toda la superficie legacy (~110
- * servicios) sin saturar al agente. Las de lectura/análisis van primero; las de
- * escritura llevan annotation readOnlyHint:false y aviso de "confirmar antes".
+ * Arquitectura HÍBRIDA (la API tiene 87 queries + 745 mutations → inviable 1:1):
+ *   A) ~24 tools CURADAS para el flujo real de un estudio (Cota Zero): identidad,
+ *      proyectos/tareas/personas, fichaje de horas (alta/edición/borrado),
+ *      timesheets (enviar/aprobar/rechazar), tags, ausencias e informes.
+ *   B) 3 tools GENÉRICAS para cobertura del 100%:
+ *      - beebole_search_schema       descubre cualquier operación por palabra clave
+ *      - beebole_describe_operation  da su firma completa (args + inputs + retorno)
+ *      - beebole_graphql             ejecuta cualquier query/mutation cruda
+ *
+ * Con A+B el agente resuelve el 80% con tools claras y el 20% restante (las ~800
+ * operaciones de administración/config) vía descubrir → describir → ejecutar.
+ *
+ * Factoría: buildServer(apiKey) → McpServer ligado a un cliente (un token). En
+ * stdio el token viene del entorno; en HTTP, de la cabecera por petición.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { BeeboleClient, BeeboleError, type EntityRef } from './beebole.js';
+import { BeeboleClient, BeeboleError, selection, searchOps, describeOp, gqlArgs } from './client.js';
 
-const VERSION = '0.2.0';
+const VERSION = '1.0.0';
 
-const DATE = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Formato de fecha YYYY-MM-DD');
+// Selecciones reutilizables (compactas para listas, ricas para "get").
+const SEL_PROJECT = () => selection('BeeboleProject', 0);
+const SEL_TASK = () => selection('BeeboleTask', 0);
+const SEL_PERSON = () => selection('BeebolePerson', 0);
+const SEL_TR = () => selection('BeeboleTimeRecord', 1);
+const SEL_TAG = () => selection('BeeboleTag', 0);
+const SEL_ABS = () => selection('BeeboleAbsenceType', 0);
+const SEL_REPORT = () => selection('BeeboleReport', 0);
+const SEL_EVENT = () => selection('BeeboleApprovalEvent', 0);
 
-function ok(data: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+type ToolResult = {
+  content: { type: 'text'; text: string }[];
+  structuredContent?: Record<string, unknown>;
+  isError?: boolean;
+};
+
+function ok(data: unknown): ToolResult {
+  const json = JSON.stringify(data, null, 2);
+  const text = json.length > 100_000 ? json.slice(0, 100_000) + '\n…(truncado)…' : json;
+  return {
+    content: [{ type: 'text', text }],
+    structuredContent: data && typeof data === 'object' ? (data as Record<string, unknown>) : { value: data },
+  };
 }
-function fail(err: unknown) {
-  const msg =
-    err instanceof BeeboleError ? err.message : `Error inesperado: ${(err as Error).message}`;
-  return { content: [{ type: 'text' as const, text: msg }], isError: true };
+
+function fail(err: unknown): ToolResult {
+  const msg = err instanceof BeeboleError ? err.message : `Error inesperado: ${(err as Error).message}`;
+  return { content: [{ type: 'text', text: `❌ ${msg}` }], isError: true };
 }
-/** Envuelve un handler async para no romper nunca la sesión MCP. */
-function guard<T>(fn: (args: T) => Promise<unknown>) {
-  return async (args: T) => {
+
+/** Envuelve un handler async con try/catch → ToolResult de error accionable. */
+function guard<A>(fn: (args: A) => Promise<ToolResult>) {
+  return async (args: A): Promise<ToolResult> => {
     try {
-      return ok(await fn(args));
-    } catch (e) {
-      return fail(e);
+      return await fn(args);
+    } catch (err) {
+      return fail(err);
     }
   };
 }
 
-/** Construye la EntityRef del cliente a partir de tipo + id. */
-function refOf(type: 'company' | 'project' | 'subproject' | 'absence', id: string): EntityRef {
-  return { [type]: id } as EntityRef;
-}
+const TS = z.number().int().describe('Unix timestamp en MILISEGUNDOS (epoch ms, > 1e10). Ej: 1750000000000.');
+const ID = z.string().describe('BeeboleId (ObjectId, 24 hex).');
 
-export function buildServer(apiToken: string): McpServer {
+export function buildServer(apiKey: string): McpServer {
+  const beebole = new BeeboleClient(apiKey);
   const server = new McpServer({ name: 'beebole-mcp', version: VERSION });
-  const client = new BeeboleClient(apiToken);
+  const RO = { readOnlyHint: true, openWorldHint: true } as const;
+  const WR = { readOnlyHint: false, destructiveHint: false, openWorldHint: true } as const;
+  const DESTR = { readOnlyHint: false, destructiveHint: true, openWorldHint: true } as const;
 
-  const READ = { readOnlyHint: true, openWorldHint: true } as const;
-  const WRITE = { readOnlyHint: false, openWorldHint: true } as const;
+  // ── A) Identidad / contexto ────────────────────────────────────────────────
 
-  // ── 1. Catálogos ────────────────────────────────────────────────────
   server.registerTool(
-    'beebole_list',
+    'beebole_whoami',
     {
+      title: 'Quién soy + organización',
       description:
-        'Lista catálogos de Beebole: companies (clientes), projects, subprojects, tasks, people, absence types o custom fields. Para projects/subprojects acepta parentId (company/project) como filtro. Punto de partida para casi todo: de aquí salen los IDs que usan las demás tools.',
-      inputSchema: {
-        entity: z
-          .enum(['company', 'project', 'subproject', 'task', 'person', 'absence', 'custom_field'])
-          .describe('Catálogo a listar'),
-        parentId: z
-          .string()
-          .optional()
-          .describe('Filtro: company id (si entity=project) o project id (si entity=subproject)'),
-      },
-      annotations: { title: 'Listar catálogo Beebole', ...READ },
-    },
-    guard(({ entity, parentId }) => client.list(entity, parentId)),
-  );
-
-  // ── 2. Detalle de entidad ───────────────────────────────────────────
-  server.registerTool(
-    'beebole_get',
-    {
-      description:
-        'Obtiene el detalle de una entidad por id: company, project, subproject, person, task o group.',
-      inputSchema: {
-        entity: z.enum(['company', 'project', 'subproject', 'person', 'task', 'group']),
-        id: z.string().describe('ID de la entidad'),
-      },
-      annotations: { title: 'Detalle de entidad', ...READ },
-    },
-    guard(({ entity, id }) => client.get(entity, id)),
-  );
-
-  // ── 3. Entidades imputables ─────────────────────────────────────────
-  server.registerTool(
-    'beebole_get_loggable_entities',
-    {
-      description:
-        'Navega el árbol company › project › subproject para una fecha y devuelve dónde se pueden imputar horas. Sin parent, parte de la raíz. Úsala antes de log_time para resolver el destino correcto.',
-      inputSchema: {
-        date: DATE.describe('Fecha del registro a imputar'),
-        parentType: z.enum(['company', 'project', 'subproject']).optional(),
-        parentId: z.string().optional().describe('ID del padre (requerido si parentType)'),
-      },
-      annotations: { title: 'Entidades imputables', ...READ },
-    },
-    guard(({ date, parentType, parentId }) =>
-      client.getLoggableEntities(
-        date,
-        parentType && parentId ? refOf(parentType, parentId) : undefined,
-      ),
-    ),
-  );
-
-  // ── 4. Tareas imputables ────────────────────────────────────────────
-  server.registerTool(
-    'beebole_get_loggable_tasks',
-    {
-      description:
-        'Lista las tareas disponibles para imputar en una entidad concreta y fecha. La tarea es obligatoria al imputar si la entidad las tiene.',
-      inputSchema: {
-        entityType: z.enum(['company', 'project', 'subproject']),
-        entityId: z.string(),
-        date: DATE,
-      },
-      annotations: { title: 'Tareas imputables', ...READ },
-    },
-    guard(({ entityType, entityId, date }) =>
-      client.getLoggableTasks(date, refOf(entityType, entityId)),
-    ),
-  );
-
-  // ── 5. Imputaciones de una persona ──────────────────────────────────
-  server.registerTool(
-    'beebole_list_time_entries',
-    {
-      description:
-        'Lista las imputaciones de horas de UNA persona en un rango de fechas. Para análisis agregado de varias personas/proyectos usa mejor beebole_export_time.',
-      inputSchema: {
-        personId: z.string().describe('ID de persona (de beebole_list entity=person)'),
-        from: DATE.describe('Fecha inicial (incluida)'),
-        to: DATE.describe('Fecha final (incluida)'),
-      },
-      annotations: { title: 'Imputaciones por persona', ...READ },
-    },
-    guard(({ personId, from, to }) => client.listTimeEntries(personId, from, to)),
-  );
-
-  // ── 6. Export / análisis ────────────────────────────────────────────
-  server.registerTool(
-    'beebole_export_time',
-    {
-      description:
-        'EXPORT de time records para análisis: rango de fechas + filtros opcionales (grupos/tags, estado de aprobación, una entidad). Lanza un job en Beebole y espera el resultado (puede tardar unos segundos). Devuelve filas con horas por persona/proyecto/tarea — la base para "horas por proyecto", desviaciones y rentabilidad.',
-      inputSchema: {
-        from: DATE,
-        to: DATE,
-        outputFormat: z
-          .enum(['array', 'csv'])
-          .optional()
-          .describe('array (por defecto, JSON tabular) o csv'),
-        statusFilters: z
-          .array(z.string())
-          .optional()
-          .describe('Filtros de estado de aprobación (p.ej. ["l","a"] = locked/approved)'),
-        gids: z.array(z.string()).optional().describe('IDs de grupos/tags para filtrar'),
-        entityType: z.enum(['company', 'project', 'subproject']).optional(),
-        entityId: z.string().optional().describe('Acota el export a esta entidad (con entityType)'),
-      },
-      annotations: { title: 'Export de horas (análisis)', ...READ },
-    },
-    guard(({ from, to, outputFormat, statusFilters, gids, entityType, entityId }) =>
-      client.exportTime({
-        from,
-        to,
-        outputFormat,
-        statusFilters,
-        gids,
-        entity: entityType && entityId ? refOf(entityType, entityId) : undefined,
-      }),
-    ),
-  );
-
-  // ── 7. Alta de horas (WRITE) ────────────────────────────────────────
-  server.registerTool(
-    'beebole_log_time',
-    {
-      description:
-        'Registra horas (ESCRITURA — confirma con el usuario antes de ejecutar). hours en DECIMAL (1.5 = 1h30). El destino es una sola entidad: company, project, subproject o absence. Si la entidad tiene tareas, taskId es obligatorio (usa beebole_get_loggable_tasks).',
-      inputSchema: {
-        targetType: z.enum(['company', 'project', 'subproject', 'absence']),
-        targetId: z.string().describe('ID de la entidad destino'),
-        date: DATE,
-        hours: z.number().positive().describe('Horas en decimal (1.5 = 1h30)'),
-        taskId: z.string().optional().describe('ID de tarea (obligatorio si la entidad tiene tareas)'),
-        comment: z.string().optional(),
-        xid: z.string().optional().describe('ID externo para idempotencia/mapeo'),
-      },
-      annotations: { title: 'Registrar horas', ...WRITE },
-    },
-    guard(({ targetType, targetId, date, hours, taskId, comment, xid }) =>
-      client.createTimeEntry({ entity: refOf(targetType, targetId), date, hours, taskId, comment, xid }),
-    ),
-  );
-
-  // ── 8. Editar horas (WRITE) ─────────────────────────────────────────
-  server.registerTool(
-    'beebole_update_time_entry',
-    {
-      description:
-        'Modifica una imputación existente (ESCRITURA). Requiere id + date de la imputación. Solo cambia los campos que envíes.',
-      inputSchema: {
-        id: z.string(),
-        date: DATE.describe('Fecha actual de la imputación'),
-        targetType: z.enum(['company', 'project', 'subproject', 'absence']).optional(),
-        targetId: z.string().optional(),
-        hours: z.number().positive().optional(),
-        taskId: z.string().optional(),
-        comment: z.string().optional(),
-      },
-      annotations: { title: 'Editar imputación', ...WRITE, idempotentHint: true },
-    },
-    guard(({ id, date, targetType, targetId, hours, taskId, comment }) =>
-      client.updateTimeEntry({
-        id,
-        date,
-        entity: targetType && targetId ? refOf(targetType, targetId) : undefined,
-        hours,
-        taskId,
-        comment,
-      }),
-    ),
-  );
-
-  // ── 9. Borrar horas (WRITE / destructivo) ───────────────────────────
-  server.registerTool(
-    'beebole_delete_time_entry',
-    {
-      description:
-        'Borra una imputación por id + date (ESCRITURA DESTRUCTIVA — pide confirmación explícita). No se puede deshacer.',
-      inputSchema: { id: z.string(), date: DATE },
-      annotations: { title: 'Borrar imputación', ...WRITE, destructiveHint: true },
-    },
-    guard(({ id, date }) => client.deleteTimeEntry(id, date)),
-  );
-
-  // ── 10. Timesheets: aprobación / bloqueo (WRITE) ────────────────────
-  server.registerTool(
-    'beebole_timesheet',
-    {
-      description:
-        'Acciones de workflow sobre el timesheet de una persona (ESCRITURA): submit (enviar a aprobación), approve, reject (requiere memo, se notifica al empleado), lock, unlock. Por rango (from+to) o por imputación concreta (entryId+date).',
-      inputSchema: {
-        action: z.enum(['submit', 'approve', 'reject', 'lock', 'unlock']),
-        personId: z.string(),
-        from: DATE.optional(),
-        to: DATE.optional(),
-        entryId: z.string().optional(),
-        date: DATE.optional(),
-        memo: z.string().optional().describe('Motivo (obligatorio en reject)'),
-      },
-      annotations: { title: 'Aprobación de timesheet', ...WRITE },
-    },
-    guard((a) => client.timesheetAction(a)),
-  );
-
-  // ── 11. Gestión de catálogo (WRITE) ─────────────────────────────────
-  server.registerTool(
-    'beebole_manage_entity',
-    {
-      description:
-        'CRUD de catálogo (ESCRITURA): crea, actualiza, activa o desactiva company, project, subproject, task o person. "fields" es un objeto con los atributos (p.ej. {name, company:{id}} al crear un project; {name, company:{id}, email, invite, userGroup} al crear una person). Para activate/deactivate basta id.',
-      inputSchema: {
-        entity: z.enum(['company', 'project', 'subproject', 'task', 'person']),
-        action: z.enum(['create', 'update', 'activate', 'deactivate']),
-        id: z.string().optional().describe('ID (requerido en update/activate/deactivate)'),
-        fields: z
-          .record(z.string(), z.any())
-          .optional()
-          .describe('Atributos del recurso para create/update'),
-      },
-      annotations: { title: 'Gestionar catálogo', ...WRITE },
-    },
-    guard(({ entity, action, id, fields }) => client.manage(entity, action, { id, fields })),
-  );
-
-  // ── 12. Miembros y managers (WRITE) ─────────────────────────────────
-  server.registerTool(
-    'beebole_manage_membership',
-    {
-      description:
-        'Asigna/quita personas o grupos a una company/project/subproject; en project también managers (ESCRITURA). Indica personId O groupId.',
-      inputSchema: {
-        op: z.enum(['attach_member', 'detach_member', 'attach_manager', 'detach_manager']),
-        scope: z.enum(['company', 'project', 'subproject']),
-        scopeId: z.string(),
-        personId: z.string().optional(),
-        groupId: z.string().optional(),
-      },
-      annotations: { title: 'Miembros y managers', ...WRITE },
-    },
-    guard((a) => client.membership(a)),
-  );
-
-  // ── 13. Árbol de grupos/tags ────────────────────────────────────────
-  server.registerTool(
-    'beebole_group_tree',
-    {
-      description:
-        'Devuelve el árbol jerárquico completo de grupos/tags de la cuenta (para filtrar exports por gids o para etiquetar entidades).',
+        'Devuelve la persona autenticada por la API key (id, nombre, email, rol) y su organización. Empieza por aquí para conocer tu propio personId y el contexto de la cuenta.',
       inputSchema: {},
-      annotations: { title: 'Árbol de grupos', ...READ },
+      annotations: RO,
     },
-    guard(() => client.groupTree()),
+    guard(async () => {
+      const q = `query{ currentPerson{ ${selection('BeebolePerson', 1)} } currentOrganisation{ ${selection(
+        'BeeboleOrganisation',
+        0,
+      )} } }`;
+      return ok(await beebole.graphql(q));
+    }),
   );
 
-  // ── 14. Gestión de grupos (WRITE) ───────────────────────────────────
+  // ── A) Lecturas: proyectos / tareas / personas ─────────────────────────────
+
   server.registerTool(
-    'beebole_manage_group',
+    'beebole_list_projects',
     {
+      title: 'Listar proyectos',
       description:
-        'Crea, renombra/mueve o elimina un grupo/tag (ESCRITURA). En create/update: name y opcional parentId. En delete: id.',
+        'Lista proyectos con filtros opcionales. Sin filtros devuelve los proyectos de nivel raíz activos.',
       inputSchema: {
-        action: z.enum(['create', 'update', 'delete']),
-        id: z.string().optional(),
+        archived: z.boolean().optional().describe('Incluir/solo archivados.'),
+        name: z.string().optional().describe('Filtra por nombre (substring).'),
+        categoryId: ID.optional(),
+        tagIds: z.array(z.string()).optional().describe('Solo proyectos con estos tags.'),
+        assignedPersonId: ID.optional(),
+        managedById: ID.optional(),
+      },
+      annotations: RO,
+    },
+    guard(async (a) => {
+      const filter: Record<string, unknown> = {};
+      if (a.name !== undefined) filter.name = a.name;
+      if (a.tagIds !== undefined) filter.tagIds = a.tagIds;
+      if (a.assignedPersonId !== undefined) filter.assignedPersonId = a.assignedPersonId;
+      if (a.managedById !== undefined) filter.managedById = a.managedById;
+      const { decls, args, variables } = gqlArgs([
+        { name: 'filter', type: '[BeeboleProjectFilter]', value: Object.keys(filter).length ? [filter] : undefined },
+        { name: 'archived', type: 'Boolean', value: a.archived },
+        { name: 'categoryId', type: 'BeeboleId', value: a.categoryId },
+      ]);
+      const q = `query${decls}{ getProjects${args}{ ${SEL_PROJECT()} } }`;
+      const d = await beebole.graphql<{ getProjects: unknown[] }>(q, variables);
+      return ok(d.getProjects);
+    }),
+  );
+
+  server.registerTool(
+    'beebole_get_project',
+    {
+      title: 'Detalle de un proyecto',
+      description: 'Devuelve un proyecto por id con detalle (categoría, padre, managers, budgets).',
+      inputSchema: { id: ID },
+      annotations: RO,
+    },
+    guard(async (a) => {
+      const q = `query($id:BeeboleId!){ getProject(id:$id){ ${selection('BeeboleProject', 1)} } }`;
+      return ok((await beebole.graphql<{ getProject: unknown }>(q, { id: a.id })).getProject);
+    }),
+  );
+
+  server.registerTool(
+    'beebole_list_tasks',
+    {
+      title: 'Listar tareas',
+      description: 'Lista tareas con filtros (proyecto, estado, responsable, persona asignada, categoría, rango).',
+      inputSchema: {
+        projectId: ID.optional(),
+        statusId: ID.optional(),
+        ownerId: ID.optional(),
+        assignedPersonId: ID.optional(),
         name: z.string().optional(),
-        parentId: z.string().optional(),
+        archived: z.boolean().optional(),
+        categoryId: ID.optional(),
+        startTime: TS.optional(),
+        endTime: TS.optional(),
       },
-      annotations: { title: 'Gestionar grupo', ...WRITE },
+      annotations: RO,
     },
-    guard(({ action, id, name, parentId }) => client.manageGroup(action, { id, name, parentId })),
+    guard(async (a) => {
+      const filter: Record<string, unknown> = {};
+      for (const k of ['projectId', 'statusId', 'ownerId', 'assignedPersonId', 'name'] as const)
+        if (a[k] !== undefined) filter[k] = a[k];
+      const { decls, args, variables } = gqlArgs([
+        { name: 'filter', type: '[BeeboleTaskFilter]', value: Object.keys(filter).length ? [filter] : undefined },
+        { name: 'archived', type: 'Boolean', value: a.archived },
+        { name: 'categoryId', type: 'BeeboleId', value: a.categoryId },
+        { name: 'startTime', type: 'BeeboleTimestamp', value: a.startTime },
+        { name: 'endTime', type: 'BeeboleTimestamp', value: a.endTime },
+      ]);
+      const q = `query${decls}{ getTasks${args}{ ${SEL_TASK()} } }`;
+      return ok((await beebole.graphql<{ getTasks: unknown[] }>(q, variables)).getTasks);
+    }),
   );
 
-  // ── 15. Etiquetar entidad (WRITE) ───────────────────────────────────
   server.registerTool(
-    'beebole_tag_entity',
+    'beebole_get_task',
     {
-      description:
-        'Añade o quita una entidad (company/project/subproject/task/person/absence) de un grupo/tag (ESCRITURA).',
-      inputSchema: {
-        op: z.enum(['add_group', 'remove_group']),
-        entity: z.enum(['company', 'project', 'subproject', 'task', 'person', 'absence']),
-        entityId: z.string(),
-        groupId: z.string(),
-      },
-      annotations: { title: 'Etiquetar entidad', ...WRITE },
+      title: 'Detalle de una tarea',
+      description: 'Devuelve una tarea por id con detalle.',
+      inputSchema: { id: ID },
+      annotations: RO,
     },
-    guard((a) => client.tagEntity(a)),
+    guard(async (a) => {
+      const q = `query($id:BeeboleId!){ getTask(id:$id){ ${selection('BeeboleTask', 1)} } }`;
+      return ok((await beebole.graphql<{ getTask: unknown }>(q, { id: a.id })).getTask);
+    }),
   );
 
-  // ── 16. Custom fields (READ + WRITE) ────────────────────────────────
   server.registerTool(
-    'beebole_custom_field',
+    'beebole_list_persons',
     {
-      description:
-        'Custom fields: op=list_definitions (todas las definiciones); op=get_values (valores de una entidad); op=set (fija valor); op=clear (borra valor). Para get_values/set/clear indica entity + entityId + customFieldId (y value en set).',
+      title: 'Listar personas',
+      description: 'Lista las personas (usuarios) de la organización, con filtros opcionales.',
       inputSchema: {
-        op: z.enum(['list_definitions', 'get_values', 'set', 'clear']),
-        entity: z.enum(['company', 'project', 'subproject', 'person']).optional(),
-        entityId: z.string().optional(),
-        customFieldId: z.string().optional(),
-        value: z.string().optional(),
+        archived: z.boolean().optional(),
+        roleId: ID.optional(),
+        name: z.string().optional(),
+        tagIds: z.array(z.string()).optional(),
       },
-      annotations: { title: 'Custom fields', openWorldHint: true },
+      annotations: RO,
     },
-    guard(({ op, entity, entityId, customFieldId, value }) => {
-      if (op === 'list_definitions') return client.listCustomFields();
-      if (!entity || !entityId) {
-        throw new BeeboleError('get_values/set/clear requieren entity + entityId.');
-      }
-      if (op === 'get_values') return client.getCustomFieldValues(entity, entityId);
-      if (!customFieldId) throw new BeeboleError('set/clear requieren customFieldId.');
-      return client.setCustomFieldValue({
-        entity,
-        entityId,
-        customFieldId,
-        value: op === 'set' ? value : undefined,
+    guard(async (a) => {
+      const filter: Record<string, unknown> = {};
+      if (a.roleId !== undefined) filter.roleId = a.roleId;
+      if (a.name !== undefined) filter.name = a.name;
+      if (a.tagIds !== undefined) filter.tagIds = a.tagIds;
+      const { decls, args, variables } = gqlArgs([
+        { name: 'filter', type: '[BeebolePersonFilter]', value: Object.keys(filter).length ? [filter] : undefined },
+        { name: 'archived', type: 'Boolean', value: a.archived },
+      ]);
+      const q = `query${decls}{ getPersons${args}{ ${SEL_PERSON()} } }`;
+      return ok((await beebole.graphql<{ getPersons: unknown[] }>(q, variables)).getPersons);
+    }),
+  );
+
+  server.registerTool(
+    'beebole_get_person',
+    {
+      title: 'Detalle de una persona',
+      description: 'Devuelve una persona por id con detalle (rol, organización, ajustes).',
+      inputSchema: { id: ID },
+      annotations: RO,
+    },
+    guard(async (a) => {
+      const q = `query($id:BeeboleId!){ getPerson(id:$id){ ${selection('BeebolePerson', 1)} } }`;
+      return ok((await beebole.graphql<{ getPerson: unknown }>(q, { id: a.id })).getPerson);
+    }),
+  );
+
+  // ── A) Time records (fichaje de horas — el núcleo) ─────────────────────────
+
+  const trFilterSchema = {
+    startTime: TS.optional().describe('Inicio del rango (epoch ms).'),
+    endTime: TS.optional().describe('Fin del rango (epoch ms).'),
+    personId: ID.optional(),
+    personIds: z.array(z.string()).optional(),
+    projectIds: z.array(z.string()).optional(),
+    taskIds: z.array(z.string()).optional(),
+    status: z.enum(['d', 's', 'a', 'r']).optional().describe('d=draft, s=submitted, a=approved, r=rejected.'),
+    onlyTime: z.boolean().optional().describe('Solo imputaciones de tiempo (no ausencias).'),
+    onlyAbsence: z.boolean().optional().describe('Solo ausencias.'),
+    wfh: z.boolean().optional().describe('Solo teletrabajo.'),
+  };
+
+  function trArgs(a: Record<string, unknown>) {
+    const filter: Record<string, unknown> = {};
+    for (const k of ['personId', 'personIds', 'projectIds', 'taskIds', 'status'] as const)
+      if (a[k] !== undefined) filter[k] = a[k];
+    return gqlArgs([
+      { name: 'startTime', type: 'BeeboleTimestamp', value: a.startTime },
+      { name: 'endTime', type: 'BeeboleTimestamp', value: a.endTime },
+      { name: 'time', type: 'Boolean', value: a.onlyTime },
+      { name: 'absence', type: 'Boolean', value: a.onlyAbsence },
+      { name: 'wfh', type: 'Boolean', value: a.wfh },
+      { name: 'filter', type: '[BeeboleTimeRecordFilter]', value: Object.keys(filter).length ? [filter] : undefined },
+    ]);
+  }
+
+  server.registerTool(
+    'beebole_list_time_records',
+    {
+      title: 'Listar imputaciones de horas',
+      description:
+        'Lista los time records (horas/ausencias fichadas) en un rango con filtros por persona, proyecto, tarea o estado. Pasa startTime/endTime (epoch ms) para acotar.',
+      inputSchema: trFilterSchema,
+      annotations: RO,
+    },
+    guard(async (a) => {
+      const { decls, args, variables } = trArgs(a);
+      const q = `query${decls}{ getTimeRecords${args}{ ${SEL_TR()} } }`;
+      return ok((await beebole.graphql<{ getTimeRecords: unknown[] }>(q, variables)).getTimeRecords);
+    }),
+  );
+
+  server.registerTool(
+    'beebole_count_time_records',
+    {
+      title: 'Contar imputaciones',
+      description: 'Cuenta los time records que casan el filtro (útil antes de listar rangos grandes).',
+      inputSchema: trFilterSchema,
+      annotations: RO,
+    },
+    guard(async (a) => {
+      const { decls, args, variables } = trArgs(a);
+      const q = `query${decls}{ countTimeRecords${args} }`;
+      return ok(await beebole.graphql(q, variables));
+    }),
+  );
+
+  server.registerTool(
+    'beebole_add_time_record',
+    {
+      title: 'Fichar horas (crear imputación)',
+      description:
+        'Crea una imputación de horas para una persona. duration en MINUTOS. startTime en epoch ms. Indica taskId (y opcionalmente projectIds) para tiempo, o absenceId para una ausencia. comment/nonBillable/wfh se aplican tras crear.',
+      inputSchema: {
+        personId: ID,
+        startTime: TS.describe('Inicio (epoch ms). Para fichaje por día, usa el inicio del día.'),
+        durationMinutes: z.number().int().positive().describe('Duración en minutos (ej. 90 = 1h30).'),
+        endTime: TS.optional(),
+        taskId: ID.optional(),
+        projectIds: z.array(z.string()).optional(),
+        absenceId: ID.optional().describe('Para fichar una ausencia en lugar de tiempo.'),
+        comment: z.string().optional(),
+        nonBillable: z.boolean().optional(),
+        wfh: z.boolean().optional(),
+      },
+      annotations: WR,
+    },
+    guard(async (a) => {
+      const { decls, args, variables } = gqlArgs([
+        { name: 'startTime', type: 'BeeboleTimestamp!', value: a.startTime },
+        { name: 'endTime', type: 'BeeboleTimestamp', value: a.endTime },
+        { name: 'duration', type: 'Int!', value: a.durationMinutes },
+        { name: 'personId', type: 'BeeboleId!', value: a.personId },
+        { name: 'taskId', type: 'BeeboleId', value: a.taskId },
+        { name: 'absenceId', type: 'BeeboleId', value: a.absenceId },
+        { name: 'projectIds', type: '[BeeboleId]', value: a.projectIds },
+      ]);
+      const q = `mutation${decls}{ addTimeRecord${args}{ id } }`;
+      const created = (await beebole.graphql<{ addTimeRecord: { id: string } }>(q, variables)).addTimeRecord;
+      const id = created.id;
+      // Campos no soportados por addTimeRecord → se aplican con edits puntuales.
+      const edits = await applyTimeRecordEdits(beebole, id, {
+        comment: a.comment,
+        nonBillable: a.nonBillable,
+        wfh: a.wfh,
       });
+      if (edits) return ok(edits);
+      const got = `query($id:BeeboleId!){ getTimeRecord(id:$id){ ${SEL_TR()} } }`;
+      return ok((await beebole.graphql<{ getTimeRecord: unknown }>(got, { id })).getTimeRecord);
+    }),
+  );
+
+  server.registerTool(
+    'beebole_edit_time_record',
+    {
+      title: 'Editar una imputación',
+      description:
+        'Modifica campos de un time record existente. Pasa solo los que quieras cambiar: comment, durationMinutes, startTime, endTime, taskId, projectIds, nonBillable, wfh.',
+      inputSchema: {
+        id: ID,
+        comment: z.string().optional(),
+        durationMinutes: z.number().int().positive().optional(),
+        startTime: TS.optional(),
+        endTime: TS.optional(),
+        taskId: ID.optional(),
+        projectIds: z.array(z.string()).optional(),
+        nonBillable: z.boolean().optional(),
+        wfh: z.boolean().optional(),
+      },
+      annotations: WR,
+    },
+    guard(async (a) => {
+      const result = await applyTimeRecordEdits(beebole, a.id, a);
+      if (!result) throw new BeeboleError('No indicaste ningún campo que cambiar.');
+      return ok(result);
+    }),
+  );
+
+  server.registerTool(
+    'beebole_delete_time_records',
+    {
+      title: 'Borrar imputaciones',
+      description: 'Elimina uno o varios time records por id. Acción destructiva e irreversible.',
+      inputSchema: { ids: z.array(z.string()).min(1) },
+      annotations: DESTR,
+    },
+    guard(async (a) => {
+      const q = `mutation($ids:[BeeboleId!]!){ deleteTimeRecords(ids:$ids){ id } }`;
+      return ok(await beebole.graphql(q, { ids: a.ids }));
+    }),
+  );
+
+  server.registerTool(
+    'beebole_clone_time_records',
+    {
+      title: 'Clonar imputaciones a otro periodo',
+      description: 'Copia los time records de una persona de un periodo origen a uno destino (epoch ms).',
+      inputSchema: {
+        personId: ID,
+        sourceStartTime: TS,
+        sourceEndTime: TS,
+        targetStartTime: TS,
+        targetEndTime: TS,
+        replaceExisting: z.boolean().optional(),
+      },
+      annotations: WR,
+    },
+    guard(async (a) => {
+      const q = `mutation($personId:BeeboleId!,$ss:BeeboleTimestamp!,$se:BeeboleTimestamp!,$ts:BeeboleTimestamp!,$te:BeeboleTimestamp!,$r:Boolean){ cloneTimeRecords(personId:$personId,sourceStartTime:$ss,sourceEndTime:$se,targetStartTime:$ts,targetEndTime:$te,replaceExisting:$r){ id } }`;
+      return ok(
+        await beebole.graphql(q, {
+          personId: a.personId,
+          ss: a.sourceStartTime,
+          se: a.sourceEndTime,
+          ts: a.targetStartTime,
+          te: a.targetEndTime,
+          r: a.replaceExisting,
+        }),
+      );
+    }),
+  );
+
+  // ── A) Timesheets (workflow de aprobación) ─────────────────────────────────
+
+  server.registerTool(
+    'beebole_submit_timesheet',
+    {
+      title: 'Enviar timesheet a aprobación',
+      description: 'Envía el timesheet de una persona para un periodo (epoch ms) al flujo de aprobación.',
+      inputSchema: { personId: ID, startTime: TS, endTime: TS },
+      annotations: WR,
+    },
+    guard(async (a) => {
+      const q = `mutation($personId:BeeboleId!,$s:BeeboleTimestamp!,$e:BeeboleTimestamp!){ submitTimesheet(personId:$personId,startTime:$s,endTime:$e){ ${SEL_EVENT()} } }`;
+      return ok(await beebole.graphql(q, { personId: a.personId, s: a.startTime, e: a.endTime }));
+    }),
+  );
+
+  server.registerTool(
+    'beebole_approve_timesheet',
+    {
+      title: 'Aprobar timesheet',
+      description: 'Aprueba un evento de aprobación de timesheet por su id (lo da getPendingApprovals / submit).',
+      inputSchema: { id: ID.describe('id del approval event.') },
+      annotations: WR,
+    },
+    guard(async (a) => {
+      const q = `mutation($id:BeeboleId!){ approveTimesheet(id:$id){ ${SEL_EVENT()} } }`;
+      return ok(await beebole.graphql(q, { id: a.id }));
+    }),
+  );
+
+  server.registerTool(
+    'beebole_reject_timesheet',
+    {
+      title: 'Rechazar timesheet',
+      description: 'Rechaza un timesheet en una etapa concreta con un comentario obligatorio.',
+      inputSchema: { id: ID, stage: z.number().int(), comment: z.string().min(1) },
+      annotations: DESTR,
+    },
+    guard(async (a) => {
+      const q = `mutation($id:BeeboleId!,$stage:Int!,$comment:String!){ rejectTimesheet(id:$id,stage:$stage,comment:$comment){ ${SEL_EVENT()} } }`;
+      return ok(await beebole.graphql(q, { id: a.id, stage: a.stage, comment: a.comment }));
+    }),
+  );
+
+  // ── A) Catálogos: tags, ausencias ──────────────────────────────────────────
+
+  server.registerTool(
+    'beebole_list_tags',
+    {
+      title: 'Listar tags/grupos',
+      description: 'Lista los tags (grupos jerárquicos) usados para clasificar personas/proyectos/tareas.',
+      inputSchema: { archived: z.boolean().optional(), name: z.string().optional(), categoryId: ID.optional() },
+      annotations: RO,
+    },
+    guard(async (a) => {
+      const filter: Record<string, unknown> = {};
+      if (a.name !== undefined) filter.name = a.name;
+      const { decls, args, variables } = gqlArgs([
+        { name: 'filter', type: '[BeeboleTagFilter]', value: Object.keys(filter).length ? [filter] : undefined },
+        { name: 'archived', type: 'Boolean', value: a.archived },
+        { name: 'categoryId', type: 'BeeboleId', value: a.categoryId },
+      ]);
+      const q = `query${decls}{ getTags${args}{ ${SEL_TAG()} } }`;
+      return ok((await beebole.graphql<{ getTags: unknown[] }>(q, variables)).getTags);
+    }),
+  );
+
+  server.registerTool(
+    'beebole_list_absence_types',
+    {
+      title: 'Listar tipos de ausencia',
+      description: 'Lista los tipos de ausencia (vacaciones, baja, etc.) con su unidad (día/hora).',
+      inputSchema: { archived: z.boolean().optional() },
+      annotations: RO,
+    },
+    guard(async (a) => {
+      const { decls, args, variables } = gqlArgs([{ name: 'archived', type: 'Boolean', value: a.archived }]);
+      const q = `query${decls}{ getAbsenceTypes${args}{ ${SEL_ABS()} } }`;
+      return ok((await beebole.graphql<{ getAbsenceTypes: unknown[] }>(q, variables)).getAbsenceTypes);
+    }),
+  );
+
+  // ── A) Informes ────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    'beebole_list_reports',
+    {
+      title: 'Listar informes guardados',
+      description: 'Lista los informes definidos en la cuenta (para ejecutarlos con beebole_run_report).',
+      inputSchema: {},
+      annotations: RO,
+    },
+    guard(async () => {
+      const q = `query{ getReports{ ${SEL_REPORT()} } }`;
+      return ok((await beebole.graphql<{ getReports: unknown[] }>(q)).getReports);
+    }),
+  );
+
+  server.registerTool(
+    'beebole_run_report',
+    {
+      title: 'Ejecutar un informe guardado',
+      description:
+        'Ejecuta un informe guardado por id y devuelve sus filas. Hace polling si el informe es asíncrono (campo pending). period/filters son opcionales para sobrescribir el rango.',
+      inputSchema: {
+        id: ID,
+        period: z
+          .object({
+            target: z.enum(['current', 'previous', 'next', 'yearToDay', 'last12Months', 'custom']),
+            period: z.enum(['day', 'week', 'biWeekly', 'semiMonth', 'month', 'quarter', 'year']).optional(),
+            start: TS.optional(),
+            end: TS.optional(),
+          })
+          .optional()
+          .describe('Periodo a aplicar; con target="custom" usa start/end (epoch ms).'),
+        filters: z.array(z.record(z.string(), z.unknown())).optional().describe('Array de BeeboleReportFilter.'),
+      },
+      annotations: RO,
+    },
+    guard(async (a) => {
+      const { decls, args, variables } = gqlArgs([
+        { name: 'id', type: 'BeeboleId!', value: a.id },
+        { name: 'period', type: 'BeeboleReportParamPeriodInput', value: a.period },
+        { name: 'filters', type: '[BeeboleReportFilter]', value: a.filters },
+      ]);
+      const runQ = `query${decls}{ x:runReport${args}{ ${selection('BeeboleReportResult', 1)} } }`;
+      let result = (await beebole.graphql<{ x: { id: string; pending: boolean } }>(runQ, variables)).x;
+      for (let i = 0; result?.pending && i < 20; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const pq = `query($id:BeeboleId!){ getReportResult(id:$id){ ${selection('BeeboleReportResult', 1)} } }`;
+        result = (
+          await beebole.graphql<{ getReportResult: { id: string; pending: boolean } }>(pq, { id: result.id })
+        ).getReportResult;
+      }
+      return ok(result);
+    }),
+  );
+
+  server.registerTool(
+    'beebole_planned_vs_real',
+    {
+      title: 'Informe planificado vs real',
+      description:
+        'Compara horas planificadas vs reales en un rango (epoch ms). Útil para seguimiento de presupuesto de proyecto. Filtra por proyecto/persona vía filters.',
+      inputSchema: {
+        startTime: TS,
+        endTime: TS,
+        filters: z.array(z.record(z.string(), z.unknown())).optional(),
+        taskCategoryId: ID.optional(),
+        periodSplit: z.string().optional().describe('p.ej. "month", "week".'),
+      },
+      annotations: RO,
+    },
+    guard(async (a) => {
+      const { decls, args, variables } = gqlArgs([
+        { name: 'startTime', type: 'BeeboleTimestamp!', value: a.startTime },
+        { name: 'endTime', type: 'BeeboleTimestamp!', value: a.endTime },
+        { name: 'filters', type: '[BeeboleReportFilter]', value: a.filters },
+        { name: 'taskCategoryId', type: 'BeeboleId', value: a.taskCategoryId },
+        { name: 'periodSplit', type: 'String', value: a.periodSplit },
+      ]);
+      const q = `query${decls}{ getPlannedVsRealReport${args}{ ${selection('BeebolePlannedVsRealResult', 1)} } }`;
+      return ok(await beebole.graphql(q, variables));
+    }),
+  );
+
+  // ── A) Altas de catálogo ───────────────────────────────────────────────────
+
+  server.registerTool(
+    'beebole_add_project',
+    {
+      title: 'Crear proyecto',
+      description: 'Crea un proyecto. color = índice de paleta 0-71.',
+      inputSchema: {
+        name: z.string().min(1).max(160),
+        categoryId: ID.optional(),
+        parentId: ID.optional(),
+        color: z.number().int().min(0).max(71).optional(),
+      },
+      annotations: WR,
+    },
+    guard(async (a) => {
+      const { decls, args, variables } = gqlArgs([
+        { name: 'name', type: 'BeeboleName!', value: a.name },
+        { name: 'categoryId', type: 'BeeboleId', value: a.categoryId },
+        { name: 'parentId', type: 'BeeboleId', value: a.parentId },
+        { name: 'color', type: 'BeeboleColor', value: a.color },
+      ]);
+      const q = `mutation${decls}{ addProject${args}{ ${SEL_PROJECT()} } }`;
+      return ok(await beebole.graphql(q, variables));
+    }),
+  );
+
+  server.registerTool(
+    'beebole_add_task',
+    {
+      title: 'Crear tarea',
+      description: 'Crea una tarea (opcionalmente bajo un proyecto/padre y con estado/categoría).',
+      inputSchema: {
+        name: z.string().min(1).max(160),
+        categoryId: ID.optional(),
+        parentId: ID.optional(),
+        statusId: ID.optional(),
+        color: z.number().int().min(0).max(71).optional(),
+      },
+      annotations: WR,
+    },
+    guard(async (a) => {
+      const { decls, args, variables } = gqlArgs([
+        { name: 'name', type: 'BeeboleName!', value: a.name },
+        { name: 'categoryId', type: 'BeeboleId', value: a.categoryId },
+        { name: 'parentId', type: 'BeeboleId', value: a.parentId },
+        { name: 'statusId', type: 'BeeboleId', value: a.statusId },
+        { name: 'color', type: 'BeeboleColor', value: a.color },
+      ]);
+      const q = `mutation${decls}{ addTask${args}{ ${SEL_TASK()} } }`;
+      return ok(await beebole.graphql(q, variables));
+    }),
+  );
+
+  server.registerTool(
+    'beebole_add_person',
+    {
+      title: 'Crear persona',
+      description: 'Da de alta una persona (usuario). roleId es obligatorio (ver roles de la organización).',
+      inputSchema: {
+        name: z.string().min(1).max(160),
+        email: z.string().email(),
+        roleId: ID,
+        color: z.number().int().min(0).max(71).optional(),
+      },
+      annotations: WR,
+    },
+    guard(async (a) => {
+      const { decls, args, variables } = gqlArgs([
+        { name: 'name', type: 'BeeboleName!', value: a.name },
+        { name: 'email', type: 'BeeboleEmail!', value: a.email },
+        { name: 'roleId', type: 'BeeboleId!', value: a.roleId },
+        { name: 'color', type: 'BeeboleColor', value: a.color },
+      ]);
+      const q = `mutation${decls}{ addPerson${args}{ ${SEL_PERSON()} } }`;
+      return ok(await beebole.graphql(q, variables));
+    }),
+  );
+
+  // ── B) Genéricas: cobertura del 100% de la API ─────────────────────────────
+
+  server.registerTool(
+    'beebole_search_schema',
+    {
+      title: 'Buscar operaciones en la API',
+      description:
+        'Descubre cualquiera de las 87 queries + 745 mutations de Beebole por palabra clave (nombre o descripción). Úsalo cuando no haya una tool curada para lo que necesitas; luego beebole_describe_operation y beebole_graphql.',
+      inputSchema: {
+        keyword: z.string().min(2).describe('Palabra(s) clave. Ej: "absence quota", "expense", "schedule".'),
+        limit: z.number().int().min(1).max(100).optional(),
+      },
+      annotations: RO,
+    },
+    guard(async (a) => {
+      const hits = searchOps(a.keyword, a.limit ?? 40);
+      const text = hits.length
+        ? hits.map((h) => `[${h.kind}] ${h.signature}${h.description ? `\n    ${h.description}` : ''}`).join('\n')
+        : 'Sin coincidencias.';
+      return { content: [{ type: 'text', text }], structuredContent: { count: hits.length, operations: hits } };
+    }),
+  );
+
+  server.registerTool(
+    'beebole_describe_operation',
+    {
+      title: 'Describir una operación',
+      description:
+        'Devuelve la firma completa de una query/mutation: argumentos, expansión de los input objects, scalars con sus valores permitidos y forma del tipo de retorno. Úsalo antes de llamar a beebole_graphql.',
+      inputSchema: { name: z.string().min(1).describe('Nombre exacto, p.ej. "addAbsenceType".') },
+      annotations: RO,
+    },
+    guard(async (a) => {
+      const desc = describeOp(a.name);
+      if (!desc) throw new BeeboleError(`No existe la operación "${a.name}". Usa beebole_search_schema para encontrarla.`);
+      return { content: [{ type: 'text', text: desc }] };
+    }),
+  );
+
+  server.registerTool(
+    'beebole_graphql',
+    {
+      title: 'Ejecutar GraphQL crudo',
+      description:
+        'Ejecuta una query o mutation GraphQL arbitraria contra Beebole (cobertura total de la API). Pasa el documento en `query` y opcionalmente `variables`. Para operaciones sin tool curada, descúbrelas con beebole_search_schema + beebole_describe_operation. Puede modificar datos: úsalo con cuidado.',
+      inputSchema: {
+        query: z.string().min(1).describe('Documento GraphQL (query o mutation, con sus variables declaradas).'),
+        variables: z.record(z.string(), z.unknown()).optional(),
+      },
+      annotations: DESTR,
+    },
+    guard(async (a) => {
+      return ok(await beebole.graphql(a.query, a.variables ?? {}));
     }),
   );
 
   return server;
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Aplica los cambios indicados a un time record usando las mutaciones fine-grained
+ * (una por campo) en UN solo documento con alias. Devuelve el record final, o null
+ * si no había nada que cambiar.
+ */
+async function applyTimeRecordEdits(
+  beebole: BeeboleClient,
+  id: string,
+  fields: {
+    comment?: string;
+    durationMinutes?: number;
+    startTime?: number;
+    endTime?: number;
+    taskId?: string;
+    projectIds?: string[];
+    nonBillable?: boolean;
+    wfh?: boolean;
+  },
+): Promise<unknown | null> {
+  const map: { key: keyof typeof fields; mut: string; arg: string; type: string }[] = [
+    { key: 'comment', mut: 'editTimeRecordComment', arg: 'comment', type: 'String!' },
+    { key: 'durationMinutes', mut: 'editTimeRecordDuration', arg: 'duration', type: 'Int!' },
+    { key: 'startTime', mut: 'editTimeRecordStartTime', arg: 'startTime', type: 'BeeboleTimestamp' },
+    { key: 'endTime', mut: 'editTimeRecordEndTime', arg: 'endTime', type: 'BeeboleTimestamp' },
+    { key: 'taskId', mut: 'editTimeRecordTask', arg: 'taskId', type: 'BeeboleId!' },
+    { key: 'projectIds', mut: 'editTimeRecordProjects', arg: 'projectIds', type: '[BeeboleId]!' },
+    { key: 'nonBillable', mut: 'editTimeRecordNonBillable', arg: 'nonBillable', type: 'Boolean!' },
+    { key: 'wfh', mut: 'editTimeRecordWfh', arg: 'wfh', type: 'Boolean!' },
+  ];
+  const active = map.filter((m) => fields[m.key] !== undefined);
+  if (active.length === 0) return null;
+
+  const decls = ['$id: BeeboleId!', ...active.map((m) => `$${m.arg}: ${m.type}`)].join(', ');
+  const calls = active.map((m, i) => `a${i}: ${m.mut}(id: $id, ${m.arg}: $${m.arg}){ ${SEL_TR()} }`).join('\n');
+  const variables: Record<string, unknown> = { id };
+  for (const m of active) variables[m.arg] = m.key === 'durationMinutes' ? fields.durationMinutes : fields[m.key];
+
+  const q = `mutation(${decls}){\n${calls}\n}`;
+  const data = await beebole.graphql<Record<string, unknown>>(q, variables);
+  return data[`a${active.length - 1}`] ?? data;
 }
