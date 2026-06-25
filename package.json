@@ -1,6 +1,6 @@
 {
   "name": "@neonexai/beebole-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server para Beebole (control de horas) — NeoNexAI. API GraphQL nueva (app.beebole.com): ~24 tools curadas (proyectos, tareas, personas, fichaje de horas, timesheets, informes) + passthrough GraphQL (search/describe/graphql) para cobertura total (87 queries + 745 mutations). Transportes: stdio (local) + Streamable HTTP (remoto).",
   "type": "module",
   "bin": {
@@ -36,6 +36,18 @@
     "type": "git",
     "url": "git+https://github.com/NeoNexAI/beebole-mcp.git"
   },
+  "homepage": "https://github.com/NeoNexAI/beebole-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/NeoNexAI/beebole-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "beebole",
+    "time-tracking",
+    "graphql",
+    "neonexai"
+  ],
   "publishConfig": {
     "access": "public"
   }

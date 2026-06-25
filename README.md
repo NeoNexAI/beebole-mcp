@@ -65,30 +65,30 @@ Requisitos: **Node ≥ 18** y una **API key de Beebole** (`app.beebole.com → S
 
 ### A) Local en el PC del cliente (recomendado · stdio)
 
-Se ejecuta directamente desde GitHub con `npx`, sin clonar nada:
+Publicado en npm como **[`@neonexai/beebole-mcp`](https://www.npmjs.com/package/@neonexai/beebole-mcp)**.
+Se ejecuta con `npx`, sin clonar nada; `@latest` trae siempre la última versión:
 
 ```bash
-claude mcp add beebole \
+claude mcp add beebole -s user \
   --env BEEBOLE_API_KEY=TU_API_KEY \
-  -- npx -y github:NeoNexAI/beebole-mcp
+  -- npx -y @neonexai/beebole-mcp@latest
 ```
 
-- `-s user` (scope usuario) lo deja disponible en **todos los proyectos** de ese PC:
-  ```bash
-  claude mcp add beebole -s user --env BEEBOLE_API_KEY=TU_API_KEY -- npx -y github:NeoNexAI/beebole-mcp
-  ```
+- `-s user` (scope usuario) lo deja disponible en **todos los proyectos** de ese PC.
 - En **Claude Desktop**, añade el bloque equivalente en su `mcp.json`:
   ```json
   {
     "mcpServers": {
       "beebole": {
         "command": "npx",
-        "args": ["-y", "github:NeoNexAI/beebole-mcp"],
+        "args": ["-y", "@neonexai/beebole-mcp@latest"],
         "env": { "BEEBOLE_API_KEY": "TU_API_KEY" }
       }
     }
   }
   ```
+- Alternativa sin npm (instala desde GitHub; **no** auto-actualiza, `npx` cachea el clon):
+  `npx -y github:NeoNexAI/beebole-mcp`.
 
 Verifica la key **antes** de añadirlo (debe responder con tu nombre):
 
