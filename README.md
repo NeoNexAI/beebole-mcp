@@ -59,38 +59,60 @@ Flujo para algo sin tool curada: **search → describe → graphql**.
 
 ---
 
-## Instalación
+## Requisitos en el PC
 
-Requisitos: **Node ≥ 18** y una **API key de Beebole** (`app.beebole.com → Settings → API`).
+- **Node ≥ 18** instalado (para `npx`). No hay que instalar nada más: el server se
+  descarga solo al arrancar con `npx`.
+- Una **API key de Beebole** (`app.beebole.com → Settings → API`).
+- **Conexión a internet**.
+- **NO hace falta tener Beebole abierto ni instalado.** Este MCP habla
+  directamente con la **API web** de Beebole (`app.beebole.com/graphql`) usando la
+  API key; funciona aunque no tengas Beebole abierto en el navegador.
 
-### A) Local en el PC del cliente (recomendado · stdio)
+## Instalación (local · stdio · recomendado)
 
 Publicado en npm como **[`@neonexai/beebole-mcp`](https://www.npmjs.com/package/@neonexai/beebole-mcp)**.
-Se ejecuta con `npx`, sin clonar nada; `@latest` trae siempre la última versión:
+`@latest` trae siempre la última versión.
+
+### Opción 1 — con el comando de Claude Code (si tienes el CLI `claude`)
 
 ```bash
-claude mcp add beebole -s user \
-  --env BEEBOLE_API_KEY=TU_API_KEY \
-  -- npx -y @neonexai/beebole-mcp@latest
+claude mcp add beebole -s user --env BEEBOLE_API_KEY=TU_API_KEY -- npx -y @neonexai/beebole-mcp@latest
 ```
 
-- `-s user` (scope usuario) lo deja disponible en **todos los proyectos** de ese PC.
-- En **Claude Desktop**, añade el bloque equivalente en su `mcp.json`:
-  ```json
-  {
-    "mcpServers": {
-      "beebole": {
-        "command": "npx",
-        "args": ["-y", "@neonexai/beebole-mcp@latest"],
-        "env": { "BEEBOLE_API_KEY": "TU_API_KEY" }
-      }
+`-s user` lo deja disponible en **todos los proyectos** de ese PC.
+
+### Opción 2 — sin CLI, editando la configuración a mano
+
+Útil si usáis **Claude Desktop** o si el comando `claude` no existe en el equipo.
+Añade el bloque `"beebole"` dentro de `mcpServers` en el archivo de configuración
+y **reinicia la app**:
+
+- **Claude Desktop** → `C:\Users\<usuario>\AppData\Roaming\Claude\claude_desktop_config.json`
+  (en la app: *Settings → Developer → Edit Config*).
+- **Claude Code (config global de usuario)** → `C:\Users\<usuario>\.claude.json`,
+  bajo la clave raíz `mcpServers`.
+
+```json
+{
+  "mcpServers": {
+    "beebole": {
+      "command": "npx",
+      "args": ["-y", "@neonexai/beebole-mcp@latest"],
+      "env": { "BEEBOLE_API_KEY": "TU_API_KEY" }
     }
   }
-  ```
-- Alternativa sin npm (instala desde GitHub; **no** auto-actualiza, `npx` cachea el clon):
-  `npx -y github:NeoNexAI/beebole-mcp`.
+}
+```
 
-Verifica la key **antes** de añadirlo (debe responder con tu nombre):
+Reinicia la app **del todo** (en Claude Desktop, ciérrala también desde el icono de
+la bandeja del sistema → Quit).
+
+> Si la app **no encuentra `npx`** (PATH), pon la ruta absoluta como `command`
+> (en PowerShell: `where.exe npx`), con barras dobles `\\` en el JSON.
+> Alternativa sin npm (no auto-actualiza, `npx` cachea el clon): `npx -y github:NeoNexAI/beebole-mcp`.
+
+### Verifica la key antes (debe responder con tu nombre)
 
 ```bash
 curl -s -H "apikey: TU_API_KEY" -H "Content-Type: application/json" \
